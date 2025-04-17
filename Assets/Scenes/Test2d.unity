@@ -164,7 +164,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   boundsSize: {x: 2, y: 2}
-  numParticles: 562
+  numParticles: 673
   scale: 0.01
   gravity: 0
   collisionElasticity: 0.822
@@ -176,14 +176,18 @@ MonoBehaviour:
   densityKernelType: 1
   viscocityKernelType: 0
   particleColor: {r: 0, g: 0, b: 0, a: 1}
+  particleSelectedColor: {r: 0.12724805, g: 1, b: 0, a: 1}
+  particleMultipleSelectedColor: {r: 1, g: 0, b: 0.938499, a: 1}
   restDensityColor: {r: 1, g: 1, b: 1, a: 1}
   lowDensityColor: {r: 0.09765486, g: 0.39115658, b: 0.9858491, a: 1}
   highDensityColor: {r: 0.8726415, g: 0.061743494, b: 0.061743494, a: 1}
   highDensityColorSaturation: 3.1
-  showForces: 0
-  forceResolution: 20
-  arrowMagnitude: 0.05
   display: {fileID: 380272188}
+  cam: {fileID: 1724797495}
+  showForceDebug: 0
+  onlyUseNeighborForces: 0
+  highlightParticle: 0
+  selectedParticleIndex: 0
 --- !u!1 &380272187
 GameObject:
   m_ObjectHideFlags: 0

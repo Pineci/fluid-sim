@@ -56,8 +56,11 @@ public class ParticleDisplay2D : MonoBehaviour
 
     void UpdateParticleMaterial(Sim2D sim){
         material.SetBuffer("Positions2D", sim.positionsBuffer);
+        material.SetBuffer("Selected", sim.particleColorBuffer);
         material.SetFloat("scale", sim.scale);
         material.SetColor("particleColor", sim.particleColor);
+        material.SetColor("particleSecondColor", sim.particleSelectedColor);
+        material.SetColor("particleThirdColor", sim.particleMultipleSelectedColor);
     }
 
     void UpdateBackgroundMaterial(Sim2D sim){

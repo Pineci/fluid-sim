@@ -1,7 +1,12 @@
 using System;
+using System.Collections.Generic;
+using System.IO.Compression;
+using System.Linq;
+using System.Threading.Tasks;
 using Unity.Mathematics;
 using Unity.VisualScripting;
 using UnityEngine;
+using UnityEngine.Analytics;
 using UnityEngine.InputSystem;
 using UnityEngine.UIElements;
 
@@ -31,22 +36,22 @@ public class Sim2D : MonoBehaviour
 
     [Header("Visuals")]
     public Color particleColor;
+    public Color particleSelectedColor;
+    public Color particleMultipleSelectedColor;
     public Color restDensityColor;
     public Color lowDensityColor;
     public Color highDensityColor;
     [Range(0.5f, 5.0f)] public float highDensityColorSaturation;
 
-    [Header("Debug")]
-    public bool showForces;
-    private const int maxForceResolution = 40;
-    [Range(10, maxForceResolution)] public int forceResolution;
-    public float arrowMagnitude;
-    private bool forceArrowsActive;
-    private int forceArrowsCurrentResolution;
-    private Line[] forceArrows;
-
     [Header("References")]
     public ParticleDisplay2D display;
+    public Camera cam;
+
+    [Header("Debug")]
+    public bool showForceDebug = false;
+    public bool onlyUseNeighborForces = false;
+    public bool highlightParticle = false;
+    public int selectedParticleIndex;
 
     // Set up other buffers/variables
     private float2[] forces;
@@ -54,18 +59,27 @@ public class Sim2D : MonoBehaviour
     private float2[] predictedPositions;
     private float2[] velocities;
     private float[] densities;
+    private uint[] particleSelected;
+
+    // Set up ComputeBuffers
     public ComputeBuffer positionsBuffer;
+    public ComputeBuffer particleColorBuffer;
 
     private bool runSimulation = true;
 
     private InputAction pauseSimulation;
-    private InputAction mouseInteraction;
+    private InputAction interactionPosition;
+    private InputAction attract;
+    private InputAction repel;
 
     private Cells cellHashMap;
+
+    
 
     void Start()
     {
         positionsBuffer = ComputeUtil.CreateStructuredBuffer<float2>(maxParticles);
+        particleColorBuffer = ComputeUtil.CreateStructuredBuffer<uint>(maxParticles);
 
         positions = ParticleSpawner.CreateGrid(numParticles, scale);
         predictedPositions = new float2[numParticles];
@@ -73,24 +87,9 @@ public class Sim2D : MonoBehaviour
         forces = new float2[numParticles];
         velocities = new float2[numParticles];
         densities = new float[numParticles];
+        particleSelected = new uint[numParticles];
 
         display.Init(this);
-
-        // Initialize Debug arrows
-        forceArrowsActive = false;
-        forceArrows = new Line[maxForceResolution * maxForceResolution];
-        for (int i = 0; i < forceArrows.Length; i++){
-            forceArrows[i] = new Line
-            {
-                id = i,
-                color = Color.black,
-                width = 0.01f
-            };
-            forceArrows[i].Init();
-            forceArrows[i].obj.transform.SetParent(GetComponent<Transform>());
-            forceArrows[i].Hide();
-        }
-        forceArrowsCurrentResolution = 0;
 
         // Initialize Kernels
         densityKernel = new Kernel
@@ -113,71 +112,70 @@ public class Sim2D : MonoBehaviour
         };
 
         pauseSimulation = InputSystem.actions.FindAction("Pause");
+        interactionPosition = InputSystem.actions.FindAction("Mouse");
+        attract = InputSystem.actions.FindAction("Attract");
+        repel = InputSystem.actions.FindAction("Repel");
     }
 
     void OnDisable()
     {
         positionsBuffer.Release();
+        particleColorBuffer.Release();
     }
 
     float CalculateDensity(float2[] particlePositions, float2 densityPos){
         float density = 0;
-        Debug.Log("DENSITY FOR PARTICLE AT: " + densityPos);
-        // foreach (uint particleIndex in cellHashMap.GetNeighbors(particlePositions, densityPos)){
-        //     //Debug.Log("Neighbor Particle Index: " + particleIndex);
-        //     float2 diff = particlePositions[particleIndex] - densityPos;
-        //     density += mass * densityKernel.smoothingKernel(diff);
-        // }
-        Debug.Log("FINAL DENSITY: " + density);
-        for (int i = 0; i < numParticles; i++){
+        foreach (uint i in cellHashMap.GetNeighbors(particlePositions, densityPos)){
             float2 diff = particlePositions[i] - densityPos;
             density += mass * densityKernel.smoothingKernel(diff);
         }
         return density;
     }
 
-    void CalculateParticleDensity(ref float[] densities, float2[] densityPositions, float2[] particlePositions){
-        for (int i = 0; i < densityPositions.Length; i++){
-            densities[i] = CalculateDensity(particlePositions, densityPositions[i]);
-        }
+    void CalculateParticleDensity(float2[] particlePositions){
+        Parallel.For(0, numParticles, i => {
+            densities[i] = CalculateDensity(particlePositions, particlePositions[i]);
+        });
     }
 
-    void Gravity(ref float2[] forces, float[] densities){
-        for (int i = 0; i < forces.Length; i++){
+    void Gravity(){
+        Parallel.For(0, numParticles, i => {
             forces[i].y -= gravity * densities[i];
-        }
+        });
     }
 
     float CalculatePressure(float density){
         return gasConstant * (density - restDensity);
     }
 
-    void CalculatePressureForce(ref float2[] forces, float[] densities, float2[] positions, float[] particleDensities, float2[] particlePositions){
-        for (int i = 0; i < positions.Length; i++){
+    void CalculatePressureForce(float2[] particlePositions){
+        Parallel.For(0, numParticles, i => {
             float pressure_i = CalculatePressure(densities[i]);
-            for (int j = 0; j < numParticles; j++){
-                float2 diff = positions[i] - particlePositions[j];
+            foreach (uint j in cellHashMap.GetNeighbors(particlePositions, particlePositions[i])){
+                float2 diff = particlePositions[i] - particlePositions[j];
                 if (diff.x * diff.x + diff.y * diff.y < 1e-8) continue;
 
-                float pressure_j = CalculatePressure(particleDensities[j]);
+                float pressure_j = CalculatePressure(densities[j]);
                 float2 force = densityKernel.smoothingKernelGrad(diff);
-                force *= -mass * 0.5f * (pressure_i + pressure_j) / particleDensities[j];
+                force *= -mass * 0.5f * (pressure_i + pressure_j) / densities[j];
+
                 forces[i] += force;
                 //forces[j] += -force;
             }
-        }
+        });
     }
 
-    void CalculateViscocityForce(ref float2[] forces, float2[] positions){
-        for (int i = 0; i < numParticles; i++){
-            for (int j = 0; j < numParticles; j++){
-                if (i == j) continue;
-                float2 diff = positions[i] - positions[j];
+    void CalculateViscocityForce(float2[] particlePositions){
+        Parallel.For(0, numParticles, i => {
+            foreach (uint j in cellHashMap.GetNeighbors(particlePositions, particlePositions[i])){
+                float2 diff = particlePositions[i] - particlePositions[j];
+                if (diff.x * diff.x + diff.y * diff.y < 1e-8) continue;
+                
                 float2 force = viscocityKernel.smoothingKernelGrad(diff);
                 force *= viscocityConstant * mass * (velocities[j] - velocities[i]) / densities[j];
                 forces[i] += force;
             }
-        }
+        });
     }
 
     void ApplyForces(float dt){
@@ -213,82 +211,6 @@ public class Sim2D : MonoBehaviour
         }
     }
 
-    void UpdateForceArrows(bool activate){
-
-        if (activate != forceArrowsActive){
-            forceArrowsActive = activate;
-            if (!forceArrowsActive){
-                for (int i = 0; i < forceArrowsCurrentResolution * forceArrowsCurrentResolution; i++){
-                    forceArrows[i].Hide();
-                }
-                forceArrowsCurrentResolution = 0;
-            }
-        }
-
-        if (forceArrowsActive){
-            // Turn arrows on or off
-            if (forceResolution < forceArrowsCurrentResolution){
-                int startIdx = forceResolution * forceResolution;
-                int endIdx = forceArrowsCurrentResolution * forceArrowsCurrentResolution;
-                for (int i = startIdx; i < endIdx; i++){
-                    forceArrows[i].Hide();
-                }
-            }
-            if (forceResolution > forceArrowsCurrentResolution){
-                int endIdx = forceResolution * forceResolution;
-                int startIdx = forceArrowsCurrentResolution * forceArrowsCurrentResolution;
-                for (int i = startIdx; i < endIdx; i++){
-                    forceArrows[i].Show();
-                }
-            }
-            forceArrowsCurrentResolution = forceResolution;
-
-            // Update force arrows display
-            Vector3 halfBounds = boundsSize / 2f;
-            int numArrows = forceArrowsCurrentResolution * forceArrowsCurrentResolution;
-            float2[] arrowPositions = new float2[numArrows];
-            float[] arrowDensities = new float[numArrows];
-            float2[] arrowForces = new float2[numArrows];
-            for (int i = 0; i < forceArrowsCurrentResolution; i++){
-                for (int j = 0; j < forceArrowsCurrentResolution; j++){
-                    int idx = i*forceArrowsCurrentResolution + j;
-                    arrowPositions[idx] = float2.zero;
-                    arrowPositions[idx].x = Mathf.Lerp(-halfBounds.x, halfBounds.x, (float)i / (float)(forceArrowsCurrentResolution-1));
-                    arrowPositions[idx].y = Mathf.Lerp(-halfBounds.y, halfBounds.x, (float)j / (float)(forceArrowsCurrentResolution-1));
-                    //forceArrows[idx].Set(point, Vector3.up, 0.1f);
-                }
-            }
-
-            for (int i = 0; i < numArrows; i++){
-                arrowDensities[i] = CalculateDensity(predictedPositions, arrowPositions[i]);
-            }
-            Gravity(ref arrowForces, arrowDensities);
-            CalculatePressureForce(ref arrowForces, arrowDensities, arrowPositions, densities, predictedPositions);
-            //CalculateViscocityForce(ref forces, points);
-
-            // Update force arrows display
-            for (int i = 0; i < numArrows; i++){
-                Vector3 point = new Vector3(arrowPositions[i].x, arrowPositions[i].y, 0);
-                Vector3 accel = Vector3.up;
-                float scale = 0f;
-                if (arrowDensities[i] > 1e-6){
-                    accel = new Vector3(arrowForces[i].x, arrowForces[i].y, 0) / arrowDensities[i];
-                    scale = accel.magnitude;
-                    accel /= scale;
-                }
-                forceArrows[i].Set(point, accel, scale * arrowMagnitude);
-                //forceArrows[i].Set(point, Vector3.right, arrowMagnitude);
-            }
-
-        }
-
-        
-
-        
-
-        
-    }
-
     void HandleInputs(){
         if (pauseSimulation.WasPressedThisFrame()){
             runSimulation = !runSimulation;
@@ -297,35 +219,75 @@ public class Sim2D : MonoBehaviour
 
     void Update()
     {
-        HandleInputs();
-        if (!runSimulation) return;
-
         float dt = Time.deltaTime;
-
         
+        HandleInputs();
+        if (runSimulation){
 
-        //Debug.Log("Density at (0, 0): " + CalculateDensity(positions, new float2(0, 0)));
+            float simFrameRate = 1 / 120f;
 
-        UpdatePositions(ref predictedPositions, 1 / 120f);
+            UpdatePositions(ref predictedPositions, simFrameRate);
 
-        // Update neighbor map
-        // cellHashMap.UpdateSpatialLookup(predictedPositions);
+            // Update neighbor map
+            cellHashMap.UpdateSpatialLookup(predictedPositions);
 
-        // Do all forces first
-        CalculateParticleDensity(ref densities, predictedPositions, predictedPositions);
-        Gravity(ref forces, densities);
-        CalculatePressureForce(ref forces, densities, predictedPositions, densities, predictedPositions);
-        CalculateViscocityForce(ref forces, predictedPositions);
-        //UpdateForceArrows(showForces);
-        ApplyForces(dt);
+            // Do all forces first
+            CalculateParticleDensity(predictedPositions);
+            Gravity();
+            CalculatePressureForce(predictedPositions);
+            CalculateViscocityForce(predictedPositions);
+            ApplyForces(dt);
 
-        // Do positions and collisions last
-        UpdatePositions(ref positions, dt);
-        HandleCollisions();
+            // Do positions and collisions last
+            UpdatePositions(ref positions, dt);
+            HandleCollisions();
 
-        positions.CopyTo(predictedPositions, 0);
+
+            positions.CopyTo(predictedPositions, 0);
+
+        }
+
+        if (attract.IsPressed()){
+            cellHashMap.UpdateSpatialLookup(positions);
+            Vector2 mouseScreenPos = interactionPosition.ReadValue<Vector2>();
+            Vector3 mouseWorldPos = cam.ScreenToWorldPoint(new Vector3(mouseScreenPos.x, mouseScreenPos.y, 1));
+            Vector2 selectedPos = (Vector2)mouseWorldPos;
+
+            Array.Clear(particleSelected, 0, numParticles);
+
+            var coord = cellHashMap.FindCellCoord((float2)selectedPos);
+            (int coordX, int coordY) = coord;
+            var hash = cellHashMap.Hash(coordX, coordY);
+            var key = cellHashMap.KeyFromHash(hash);
+            //Debug.Log("NUM CELLS: " + cellHashMap.numCells + "CELL: " + coord + " HASH: " + hash + " KEY: " + key);
+            //Debug.Log(cellHashMap.DebugHelper(key));
+
+            if (repel.IsPressed()){
+                foreach (uint i in cellHashMap.GetNeighbors(positions, selectedPos)){
+                    particleSelected[i] += 1;
+                    particleSelected[i] = particleSelected[i] > 2 ? 2 : particleSelected[i];
+                }
+            } else {
+                for (int i = 0; i < numParticles; i++){
+                    if (coord == cellHashMap.FindCellCoord(positions[i])){
+                        particleSelected[i] = 1;
+                    }
+                }
+            }
+        } else {
+            for (int i = 0; i < numParticles; i++){
+                particleSelected[i] = 0;
+            }
+        }
+
+        if (highlightParticle){
+            particleSelected[selectedParticleIndex] = 2;
+        }
         
+        // Update Buffers
         positionsBuffer.SetData(positions);
+        particleColorBuffer.SetData(particleSelected);
+
         display.UpdateMaterials(this);
     }
 
